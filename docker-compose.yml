@@ -1,0 +1,16 @@
+version: '3.8'
+
+services:
+  goprojectgen:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: goprojectgen
+    restart: unless-stopped
+    environment:
+      - TZ=UTC
+    volumes:
+      - .:/output
+    working_dir: /output
+    stdin_open: true
+    tty: true
