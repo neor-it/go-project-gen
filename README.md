@@ -39,7 +39,7 @@ go build -o goprojectgen main.go
 ### Using Docker
 
 ```bash
-docker pull neor-it/goprojectgen:latest
+docker pull ghcr.io/neor-it/go-project-gen:latest
 ```
 
 Or build the Docker image:
