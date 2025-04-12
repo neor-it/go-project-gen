@@ -63,7 +63,7 @@ goprojectgen
 docker run -it --rm -v $(pwd):/output goprojectgen
 
 # Or with a specific Docker image
-docker run -it --rm -v $(pwd):/output neor-it/goprojectgen:latest
+docker run -it --rm -v $(pwd):/output ghcr.io/neor-it/go-project-gen:latest
 ```
 
 When using Docker, the generated project will be created in your current directory, not inside the container.
