@@ -7,8 +7,8 @@ import (
 	//"strings"
 
 	"github.com/AlecAivazis/survey/v2"
-	"github.com/username/goprojectgen/internal/config"
-	"github.com/username/goprojectgen/internal/logger"
+	"github.com/neor-it/go-project-gen/internal/config"
+	"github.com/neor-it/go-project-gen/internal/logger"
 )
 
 // Wizard represents the interactive CLI wizard
@@ -63,7 +63,6 @@ func (w *Wizard) Run() (config.ProjectConfig, error) {
 			"HTTP (Gin)",
 			"PostgreSQL",
 			"Docker",
-			"Kubernetes",
 			"CI/CD",
 		},
 		Default: []string{"HTTP (Gin)"},
@@ -74,11 +73,10 @@ func (w *Wizard) Run() (config.ProjectConfig, error) {
 
 	// Set components
 	projectCfg.Components = config.Components{
-		HTTP:       contains(components, "HTTP (Gin)"),
-		Postgres:   contains(components, "PostgreSQL"),
-		Docker:     contains(components, "Docker"),
-		Kubernetes: contains(components, "Kubernetes"),
-		CICD:       contains(components, "CI/CD"),
+		HTTP:     contains(components, "HTTP (Gin)"),
+		Postgres: contains(components, "PostgreSQL"),
+		Docker:   contains(components, "Docker"),
+		CICD:     contains(components, "CI/CD"),
 	}
 
 	// Print configuration
@@ -89,7 +87,6 @@ func (w *Wizard) Run() (config.ProjectConfig, error) {
 		"http", projectCfg.Components.HTTP,
 		"postgres", projectCfg.Components.Postgres,
 		"docker", projectCfg.Components.Docker,
-		"kubernetes", projectCfg.Components.Kubernetes,
 		"cicd", projectCfg.Components.CICD,
 	)
 

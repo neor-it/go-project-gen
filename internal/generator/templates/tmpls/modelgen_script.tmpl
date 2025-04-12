@@ -1,0 +1,839 @@
+// scripts/modelgen/modelgen.go - Database models generator from SQL migrations
+package main
+
+import (
+	"bufio"
+	"bytes"
+	"database/sql"
+	"flag"
+	"fmt"
+	"go/format"
+	"os"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
+	"text/template"
+	"time"
+
+	"github.com/gertd/go-pluralize"
+	"github.com/iancoleman/strcase"
+	"github.com/joho/godotenv"
+	_ "github.com/lib/pq"
+)
+
+// TableInfo represents table information from database or migrations
+type TableInfo struct {
+	TableName string
+	Columns   []ColumnInfo
+	// HasTime and HasNullable flags are calculated dynamically before template execution
+}
+
+// ColumnInfo represents column information
+type ColumnInfo struct {
+	Name         string
+	GoName       string
+	Type         string
+	GoType       string
+	IsNullable   bool
+	IsPrimaryKey bool
+	Tags         string
+}
+
+// modelTemplateSource holds the raw template string for model generation.
+// This constant definition is now part of the generated code.
+const modelTemplateSource = `// This file is auto-generated. DO NOT EDIT.
+// Generated on {{ .Timestamp }}
+
+package models
+
+{{ $hasTime := .HasTime -}}
+{{ $hasJSON := .HasJSON -}}
+
+{{ if or $hasTime $hasJSON -}}
+import (
+	{{ if $hasTime -}}
+	"time"
+	{{- end }}
+	{{ if $hasJSON -}}
+	"encoding/json"
+	{{- end }}
+)
+{{- end }}
+
+
+// {{ .StructName }} model represents the {{ .TableName }} table
+type {{ .StructName }} struct {
+{{ range .Columns -}}
+	{{ .GoName }} {{ .GoType }} {{ "\x60" }}db:"{{ .Name }}" json:"{{ .Name }}"{{ "\x60" }}
+{{ end -}}
+}
+
+// TableName returns the table name for {{ .StructName }}
+func ({{ .Receiver }} *{{ .StructName }}) TableName() string {
+	return "{{ .TableName }}"
+}
+` // End of modelTemplateSource definition in generated code
+
+// ModelTemplate is the template for generating models
+// It's assigned the content from the 'modelTemplateSource' constant defined above.
+const ModelTemplate = modelTemplateSource
+
+
+// Regex patterns for SQL parsing
+var (
+	createTableRegex      = regexp.MustCompile(`(?i)CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?([^\s(]+)\s*\(([^;]+)`)
+	columnDefRegex        = regexp.MustCompile(`([^,\s(]+)\s+([^,\s(]+(?:\s*\(\d+(?:,\s*\d+)?\))?)(?:\s+(NOT\s+NULL))?(?:\s+DEFAULT\s+([^,]+))?(?:\s+(PRIMARY\s+KEY))?`)
+	alterTableAddRegex    = regexp.MustCompile(`(?i)ALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?([^\s]+)\s+ADD(?:\s+COLUMN)?(?:\s+IF\s+NOT\s+EXISTS)?\s+([^;]+)`)
+	alterTableAlterRegex  = regexp.MustCompile(`(?i)ALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?([^\s]+)\s+ALTER(?:\s+COLUMN)?\s+([^;]+)`)
+	alterTableDropRegex   = regexp.MustCompile(`(?i)ALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?([^\s]+)\s+DROP(?:\s+COLUMN)?(?:\s+IF\s+EXISTS)?\s+([^;]+)`)
+	constraintRegex       = regexp.MustCompile(`(?i)CONSTRAINT\s+([^\s]+)\s+([^,]+)`)
+	primaryKeyRegex       = regexp.MustCompile(`(?i)PRIMARY\s+KEY\s*\(([^)]+)\)`)
+)
+
+func main() {
+	var (
+		envFile     = flag.String("env", ".env", "Path to .env file")
+		outputDir   = flag.String("output", "internal/db/models", "Output directory for models")
+		migrationsDir = flag.String("migrations", "internal/migrations/sql", "Directory with SQL migrations")
+		generateFromMigrations = flag.Bool("from-migrations", true, "Generate models from migration files instead of DB")
+	)
+
+	flag.Parse()
+
+	// Load environment variables from .env file
+	if err := godotenv.Load(*envFile); err != nil {
+		fmt.Printf("Warning: Error loading .env file: %v\n", err)
+	}
+
+	// Create output directory if it doesn't exist
+	if err := os.MkdirAll(*outputDir, 0755); err != nil {
+		fmt.Printf("Error: Failed to create output directory: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Create pluralizer
+	pluralize := pluralize.NewClient()
+
+	if *generateFromMigrations {
+		// Generate models from migration files
+		tables, err := parseAllMigrations(*migrationsDir)
+		if err != nil {
+			fmt.Printf("Error: Failed to parse migrations: %v\n", err)
+			os.Exit(1)
+		}
+
+		// Generate models for each table
+		for tableName, tableInfo := range tables {
+			// Skip migration table
+			if tableName == "schema_migrations" {
+				continue
+			}
+
+			generateModelFromTableInfo(tableInfo, *outputDir, pluralize)
+		}
+	} else {
+		// Get database connection string from environment
+		connString := os.Getenv("DB_CONNECTION_STRING")
+		if connString == "" {
+			fmt.Println("Error: DB_CONNECTION_STRING environment variable is not set")
+			os.Exit(1)
+		}
+
+		// Connect to database
+		db, err := sql.Open("postgres", connString)
+		if err != nil {
+			fmt.Printf("Error: Failed to connect to database: %v\n", err)
+			os.Exit(1)
+		}
+		defer db.Close()
+
+		// Test connection
+		if err := db.Ping(); err != nil {
+			fmt.Printf("Error: Failed to ping database: %v\n", err)
+			os.Exit(1)
+		}
+
+		// Get list of tables from database
+		dbTables, err := getTables(db)
+		if err != nil {
+			fmt.Printf("Error: Failed to get tables: %v\n", err)
+			os.Exit(1)
+		}
+
+		// Generate models for each table
+		for _, table := range dbTables {
+			// Skip migration table
+			if table == "schema_migrations" {
+				continue
+			}
+
+			// Get table info
+			tableInfo, err := getTableInfo(db, table)
+			if err != nil {
+				fmt.Printf("Error: Failed to get table info for %s: %v\n", table, err)
+				continue
+			}
+
+			generateModelFromTableInfo(tableInfo, *outputDir, pluralize)
+		}
+	}
+
+	fmt.Println("Model generation completed successfully.")
+}
+
+// generateModelFromTableInfo generates model file from table info
+func generateModelFromTableInfo(tableInfo TableInfo, outputDir string, pluralize *pluralize.Client) {
+	// Generate model
+	structName := strcase.ToCamel(pluralize.Singular(tableInfo.TableName))
+	receiver := strings.ToLower(string(structName[0]))
+
+	var buf bytes.Buffer
+	// Use the ModelTemplate constant which holds the model source defined above
+	tmpl, err := template.New("model").Parse(ModelTemplate)
+	if err != nil {
+		fmt.Printf("Error: Failed to parse model template: %v\n", err)
+		return
+	}
+
+	// Calculate HasTime, HasNullable, and HasJSON flags based on final column types
+	var hasTime, hasNullable, hasJSON bool
+	for _, col := range tableInfo.Columns {
+		if strings.Contains(col.GoType, "time.Time") { // Checks for time.Time or *time.Time
+			hasTime = true
+		}
+		if strings.HasPrefix(col.GoType, "*") { // Checks for any pointer type (covers *time.Time, *int, etc.)
+			hasNullable = true
+		}
+		if col.GoType == "json.RawMessage" { // Check for json.RawMessage
+			hasJSON = true
+		}
+	}
+
+	// Create template data
+	data := map[string]interface{}{
+		"StructName":  structName,
+		"TableName":   tableInfo.TableName,
+		"Columns":     tableInfo.Columns,
+		"Receiver":    receiver,
+		"HasTime":     hasTime,     // Use calculated value
+		"HasNullable": hasNullable, // Use calculated value
+		"HasJSON":     hasJSON,     // Use calculated value
+		"Timestamp":   time.Now().Format(time.RFC3339),
+	}
+
+	err = tmpl.Execute(&buf, data)
+	if err != nil {
+		fmt.Printf("Error: Failed to execute template for %s: %v\n", tableInfo.TableName, err)
+		return
+	}
+
+	// Format the generated code
+	formattedCode, err := format.Source(buf.Bytes())
+	if err != nil {
+		fmt.Printf("Error: Failed to format code for %s: %v\n", tableInfo.TableName, err)
+		fmt.Printf("Unformatted code:\n%s\n", buf.String())
+		return // Stop processing this table if formatting fails
+	}
+
+	// Write model file
+	outputFile := filepath.Join(outputDir, tableInfo.TableName+".go")
+	if err := os.WriteFile(outputFile, formattedCode, 0644); err != nil {
+		fmt.Printf("Error: Failed to write model file for %s: %v\n", tableInfo.TableName, err)
+		return
+	}
+
+	fmt.Println("Generated model for table:", tableInfo.TableName, "->", outputFile)
+}
+
+// getTables gets a list of all tables in the database
+func getTables(db *sql.DB) ([]string, error) {
+	rows, err := db.Query("SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE' ORDER BY table_name")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var tables []string
+	for rows.Next() {
+		var table string
+		if err := rows.Scan(&table); err != nil {
+			return nil, err
+		}
+		tables = append(tables, table)
+	}
+
+	return tables, rows.Err()
+}
+
+// getTableInfo gets information about a table's columns
+func getTableInfo(db *sql.DB, tableName string) (TableInfo, error) {
+	query := `
+		SELECT
+			c.column_name,
+			c.data_type,
+			c.is_nullable,
+			c.character_maximum_length,
+			c.numeric_precision,
+			c.numeric_scale,
+			c.column_default,
+			CASE WHEN pk.column_name IS NOT NULL THEN true ELSE false END AS is_primary_key
+		FROM
+			information_schema.columns c
+		LEFT JOIN (
+			SELECT
+				kcu.column_name
+			FROM
+				information_schema.table_constraints tc
+			JOIN
+				information_schema.key_column_usage kcu
+			ON
+				tc.constraint_name = kcu.constraint_name
+				AND tc.constraint_schema = kcu.constraint_schema
+			WHERE
+				tc.constraint_type = 'PRIMARY KEY'
+				AND tc.table_name = $1
+		) pk
+		ON
+			c.column_name = pk.column_name
+		WHERE
+			c.table_name = $1
+		ORDER BY
+			c.ordinal_position
+	`
+
+	rows, err := db.Query(query, tableName)
+	if err != nil {
+		return TableInfo{}, err
+	}
+	defer rows.Close()
+
+	var tableInfo TableInfo
+	tableInfo.TableName = tableName
+
+	for rows.Next() {
+		var col ColumnInfo
+		var isNullable string
+		var charMaxLength, numPrecision, numScale sql.NullInt64
+		var colDefault sql.NullString
+
+		if err := rows.Scan(&col.Name, &col.Type, &isNullable, &charMaxLength, &numPrecision, &numScale, &colDefault, &col.IsPrimaryKey); err != nil {
+			return TableInfo{}, err
+		}
+
+		col.IsNullable = isNullable == "YES"
+		col.GoName = strcase.ToCamel(col.Name)
+		col.GoType = mapPostgreSQLTypeToGo(col.Type, col.IsNullable)
+		col.Tags = fmt.Sprintf("db:\"%s\" json:\"%s\"", col.Name, col.Name)
+
+		// Flags HasTime and HasNullable are calculated later in generateModelFromTableInfo
+		tableInfo.Columns = append(tableInfo.Columns, col)
+	}
+
+	return tableInfo, rows.Err()
+}
+
+// mapPostgreSQLTypeToGo maps PostgreSQL column types to Go types
+func mapPostgreSQLTypeToGo(pgType string, isNullable bool) string {
+	lowerType := strings.ToLower(pgType)
+
+	switch lowerType {
+	case "integer", "smallint", "int", "smallserial", "serial":
+		if isNullable {
+			return "*int"
+		}
+		return "int"
+	case "bigint", "bigserial":
+		if isNullable {
+			return "*int64"
+		}
+		return "int64"
+	case "numeric", "decimal", "real", "double precision", "float", "float4", "float8":
+		if isNullable {
+			return "*float64"
+		}
+		return "float64"
+	case "boolean", "bool":
+		if isNullable {
+			return "*bool"
+		}
+		return "bool"
+	case "text", "character varying", "varchar", "char", "character", "citext":
+		if isNullable {
+			return "*string"
+		}
+		return "string"
+	case "date", "timestamp", "timestamp with time zone", "timestamp without time zone", "timestamptz":
+		if isNullable {
+			return "*time.Time"
+		}
+		return "time.Time"
+	case "uuid":
+		if isNullable {
+			return "*string" // Represent UUID as string pointer if nullable
+		}
+		return "string" // Represent UUID as string
+	case "jsonb", "json":
+		// Use json.RawMessage for JSON/JSONB types.
+		// json.RawMessage is a []byte alias, handles null correctly (becomes nil slice).
+		return "json.RawMessage"
+	default:
+		// Default to string, use pointer for nullable unknown types
+		if isNullable {
+			return "*string"
+		}
+		return "string"
+	}
+}
+
+// generateTags generates struct tags for a column
+// Note: This function seems unused in the current logic, but kept for potential future use.
+func generateTags(columnName string) string {
+	return fmt.Sprintf("db:\"%s\" json:\"%s\"", columnName, columnName)
+}
+
+// parseAllMigrations parses all migration files to generate table schemas
+func parseAllMigrations(migrationsDir string) (map[string]TableInfo, error) {
+	// Find all *.up.sql migration files
+	var migrationFiles []string
+	err := filepath.Walk(migrationsDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+
+		if !info.IsDir() && strings.HasSuffix(path, ".up.sql") {
+			migrationFiles = append(migrationFiles, path)
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to walk migrations directory: %w", err)
+	}
+
+	// Sort migration files by version number
+	sort.Slice(migrationFiles, func(i, j int) bool {
+		vI := extractVersionNumber(migrationFiles[i])
+		vJ := extractVersionNumber(migrationFiles[j])
+		return vI < vJ
+	})
+
+	// Process all migration files and build table schemas
+	tables := make(map[string]TableInfo)
+
+	for _, file := range migrationFiles {
+		content, err := os.ReadFile(file)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read migration file %s: %w", file, err)
+		}
+
+		processMigrationContent(string(content), tables)
+	}
+
+	return tables, nil
+}
+
+// extractVersionNumber extracts version number from migration filename
+func extractVersionNumber(filename string) int {
+	base := filepath.Base(filename)
+	parts := strings.Split(base, "_")
+	if len(parts) > 0 {
+		version, err := strconv.Atoi(parts[0])
+		if err == nil {
+			return version
+		}
+	}
+	return 0 // Return 0 if version number cannot be extracted
+}
+
+// processMigrationContent processes migration file content and updates table schemas
+func processMigrationContent(content string, tables map[string]TableInfo) {
+	// Split content by semicolons to get individual statements
+	statements := splitStatements(content)
+
+	for _, stmt := range statements {
+		stmt = strings.TrimSpace(stmt)
+		if stmt == "" {
+			continue
+		}
+
+		// Process CREATE TABLE statements
+		if match := createTableRegex.FindStringSubmatch(stmt); match != nil {
+			tableName := cleanIdentifier(match[1])
+			columnsDef := match[2]
+
+			table := TableInfo{
+				TableName: tableName,
+				Columns:   []ColumnInfo{},
+			}
+
+			// Extract primary keys from constraints
+			primaryKeys := extractPrimaryKeysFromConstraints(columnsDef)
+
+			// Process column definitions
+			columns := extractColumnDefinitions(columnsDef)
+
+			for _, col := range columns {
+				colName := cleanIdentifier(col.Name)
+
+				// Skip constraint definitions that might be caught as columns
+				if strings.HasPrefix(strings.ToUpper(colName), "CONSTRAINT") ||
+					strings.HasPrefix(strings.ToUpper(colName), "PRIMARY") ||
+					strings.HasPrefix(strings.ToUpper(colName), "FOREIGN") ||
+					strings.HasPrefix(strings.ToUpper(colName), "UNIQUE") ||
+					strings.HasPrefix(strings.ToUpper(colName), "CHECK") {
+					continue
+				}
+
+				// Set primary key flag if column is in primary keys list
+				col.IsPrimaryKey = isPrimaryKey(colName, primaryKeys)
+				// If it's a primary key, it cannot be nullable (common convention)
+				if col.IsPrimaryKey {
+					col.IsNullable = false
+				}
+
+				// Set Go name and type
+				col.GoName = strcase.ToCamel(colName)
+				col.GoType = mapPostgreSQLTypeToGo(col.Type, col.IsNullable)
+				col.Tags = fmt.Sprintf("db:\"%s\" json:\"%s\"", colName, colName)
+
+				// Flags HasTime and HasNullable are calculated later in generateModelFromTableInfo
+
+				table.Columns = append(table.Columns, col)
+			}
+
+			tables[tableName] = table
+		} else if match := alterTableAddRegex.FindStringSubmatch(stmt); match != nil {
+			// Process ALTER TABLE ADD COLUMN statements
+			tableName := cleanIdentifier(match[1])
+			columnDef := match[2]
+
+			// Skip if table doesn't exist yet
+			table, exists := tables[tableName]
+			if !exists {
+				// Could log a warning here if needed
+				continue
+			}
+
+			columns := extractColumnDefinitions(columnDef + ",") // Add comma to help regex match
+			for _, col := range columns {
+				colName := cleanIdentifier(col.Name)
+
+				// Skip if column already exists
+				if columnExists(table.Columns, colName) {
+					continue
+				}
+
+				// Set Go name and type
+				col.GoName = strcase.ToCamel(colName)
+				col.GoType = mapPostgreSQLTypeToGo(col.Type, col.IsNullable)
+				col.Tags = fmt.Sprintf("db:\"%s\" json:\"%s\"", colName, colName)
+
+				// Flags HasTime and HasNullable are calculated later in generateModelFromTableInfo
+
+				table.Columns = append(table.Columns, col)
+			}
+
+			tables[tableName] = table
+		} else if match := alterTableAlterRegex.FindStringSubmatch(stmt); match != nil {
+			// Process ALTER TABLE ALTER COLUMN statements
+			tableName := cleanIdentifier(match[1])
+			alterDef := match[2]
+
+			// Skip if table doesn't exist yet
+			table, exists := tables[tableName]
+			if !exists {
+				continue
+			}
+
+			// Extract column name and type/nullability changes
+			parts := strings.Fields(alterDef)
+			if len(parts) < 2 {
+				continue
+			}
+
+			colName := cleanIdentifier(parts[0])
+			action := strings.ToUpper(parts[1])
+
+			// Find column in table
+			found := false
+			for i := range table.Columns {
+				if table.Columns[i].Name == colName {
+					found = true
+					// Handle type change
+					if action == "TYPE" && len(parts) > 2 {
+						newType := parts[2]
+						// Handle potential type parameters like VARCHAR(255)
+						if strings.Contains(newType, "(") {
+							newType = newType[:strings.Index(newType, "(")]
+						}
+						table.Columns[i].Type = newType
+						// Re-evaluate GoType based on new SQL type and existing nullability
+						table.Columns[i].GoType = mapPostgreSQLTypeToGo(newType, table.Columns[i].IsNullable)
+					}
+
+					// Handle SET NOT NULL constraint
+					if action == "SET" && len(parts) > 2 && strings.ToUpper(parts[2]) == "NOT" &&
+						len(parts) > 3 && strings.ToUpper(parts[3]) == "NULL" {
+						table.Columns[i].IsNullable = false
+						// Re-evaluate GoType based on existing SQL type and new nullability
+						table.Columns[i].GoType = mapPostgreSQLTypeToGo(table.Columns[i].Type, false)
+					}
+
+					// Handle DROP NOT NULL constraint
+					if action == "DROP" && len(parts) > 2 && strings.ToUpper(parts[2]) == "NOT" &&
+						len(parts) > 3 && strings.ToUpper(parts[3]) == "NULL" {
+						table.Columns[i].IsNullable = true
+						// Re-evaluate GoType based on existing SQL type and new nullability
+						table.Columns[i].GoType = mapPostgreSQLTypeToGo(table.Columns[i].Type, true)
+					}
+
+					// Flags HasTime and HasNullable are calculated later in generateModelFromTableInfo
+					break // Exit loop once column is found and processed
+				}
+			}
+
+			if found {
+				tables[tableName] = table
+			}
+		} else if match := alterTableDropRegex.FindStringSubmatch(stmt); match != nil {
+			// Process ALTER TABLE DROP COLUMN statements
+			tableName := cleanIdentifier(match[1])
+			colName := cleanIdentifier(match[2])
+
+			// Skip if table doesn't exist yet
+			table, exists := tables[tableName]
+			if !exists {
+				continue
+			}
+
+			// Remove column from table
+			newColumns := []ColumnInfo{}
+			for _, col := range table.Columns {
+				if col.Name != colName {
+					newColumns = append(newColumns, col)
+				}
+			}
+			table.Columns = newColumns // Update columns slice
+
+			// Flags HasTime and HasNullable are calculated later in generateModelFromTableInfo
+
+			tables[tableName] = table
+		}
+	}
+}
+
+// splitStatements splits SQL content into individual statements, handling comments
+func splitStatements(content string) []string {
+	var statements []string
+	var currentStmt strings.Builder
+	inSingleLineComment := false
+	inMultiLineComment := false // Basic handling, doesn't support nested comments
+
+	scanner := bufio.NewScanner(strings.NewReader(content))
+	for scanner.Scan() {
+		line := scanner.Text()
+
+		// Simple state machine for comments
+		var processedLine strings.Builder
+		for i := 0; i < len(line); i++ {
+			if inMultiLineComment {
+				if i+1 < len(line) && line[i] == '*' && line[i+1] == '/' {
+					inMultiLineComment = false
+					i++ // Skip the '/'
+				}
+				continue // Skip characters inside multi-line comment
+			}
+			if inSingleLineComment {
+				continue // Skip rest of the line
+			}
+
+			if i+1 < len(line) {
+				if line[i] == '-' && line[i+1] == '-' {
+					inSingleLineComment = true
+					continue // Skip the comment start
+				}
+				if line[i] == '/' && line[i+1] == '*' {
+					inMultiLineComment = true
+					i++ // Skip the '*'
+					continue // Skip the comment start
+				}
+			}
+
+			// If not in comment, add character to processed line
+			processedLine.WriteByte(line[i])
+		}
+
+		inSingleLineComment = false // Reset single-line comment flag at end of line
+
+		// Process the line part that is not a comment
+		linePart := processedLine.String()
+		if strings.TrimSpace(linePart) == "" {
+			continue // Skip empty lines or lines that were entirely comments
+		}
+
+		currentStmt.WriteString(linePart)
+		currentStmt.WriteString("\n") // Preserve newlines for potential formatting importance
+
+		// Split statement if a semicolon is found outside comments/strings (basic check)
+		if strings.Contains(linePart, ";") {
+			// More robust splitting would require proper SQL parsing
+			statements = append(statements, strings.TrimSpace(currentStmt.String()))
+			currentStmt.Reset()
+		}
+	}
+
+	// Add the last statement if it doesn't end with a semicolon and is not empty
+	lastStmt := strings.TrimSpace(currentStmt.String())
+	if lastStmt != "" {
+		statements = append(statements, lastStmt)
+	}
+
+	return statements
+}
+
+
+// cleanIdentifier removes quotes and schema prefix from identifiers
+func cleanIdentifier(identifier string) string {
+	// Remove schema prefix if exists
+	if strings.Contains(identifier, ".") {
+		parts := strings.Split(identifier, ".")
+		identifier = parts[len(parts)-1]
+	}
+
+	// Remove quotes (double, single, backticks)
+	identifier = strings.Trim(identifier, "\"'`")
+
+	return strings.TrimSpace(identifier)
+}
+
+// extractColumnDefinitions extracts column definitions from CREATE TABLE or ALTER TABLE statements
+func extractColumnDefinitions(columnsDef string) []ColumnInfo {
+	var columns []ColumnInfo
+
+	// Split by commas, but handle parentheses properly (basic handling)
+	var parts []string
+	var currentPart strings.Builder
+	parenCount := 0
+
+	for _, char := range columnsDef {
+		if char == '(' {
+			parenCount++
+		} else if char == ')' {
+			parenCount--
+		}
+
+		// Split only if comma is outside parentheses
+		if char == ',' && parenCount == 0 {
+			partStr := strings.TrimSpace(currentPart.String())
+			if partStr != "" {
+				parts = append(parts, partStr)
+			}
+			currentPart.Reset()
+		} else {
+			currentPart.WriteRune(char)
+		}
+	}
+	// Add the last part if not empty
+	lastPartStr := strings.TrimSpace(currentPart.String())
+	if lastPartStr != "" {
+		parts = append(parts, lastPartStr)
+	}
+
+
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+
+		// Skip constraints defined inline (basic check)
+		upperPart := strings.ToUpper(part)
+		if strings.HasPrefix(upperPart, "CONSTRAINT") ||
+			strings.HasPrefix(upperPart, "PRIMARY KEY") || // Handled separately by primaryKeyRegex
+			strings.HasPrefix(upperPart, "FOREIGN KEY") ||
+			strings.HasPrefix(upperPart, "UNIQUE") ||
+			strings.HasPrefix(upperPart, "CHECK") {
+			continue
+		}
+
+		words := strings.Fields(part)
+		if len(words) < 2 {
+			// This might happen with trailing commas or complex definitions not fully parsed
+			// fmt.Printf("Warning: Skipping potentially invalid column definition part: %s\n", part)
+			continue
+		}
+
+		colName := cleanIdentifier(words[0])
+		colType := words[1]
+		// Handle types with parameters like VARCHAR(255) or NUMERIC(10, 2)
+		if strings.Contains(colType, "(") {
+			colType = colType[:strings.Index(colType, "(")]
+		}
+
+		column := ColumnInfo{
+			Name:       colName,
+			Type:       strings.ToLower(colType), // Store type consistently
+			IsNullable: true,  // Default to nullable, check for constraints later
+		}
+
+		// Check for NOT NULL constraint
+		// Iterate through the remaining words/tokens in the definition part
+		for i := 2; i < len(words); i++ {
+			token := strings.ToUpper(words[i])
+			if token == "NOT" && i+1 < len(words) && strings.ToUpper(words[i+1]) == "NULL" {
+				column.IsNullable = false
+				// No need to break, other constraints might exist (like PRIMARY KEY)
+			}
+			// Check for PRIMARY KEY constraint defined inline with the column
+			if token == "PRIMARY" && i+1 < len(words) && strings.ToUpper(words[i+1]) == "KEY" {
+				column.IsPrimaryKey = true
+				column.IsNullable = false // Primary keys are implicitly NOT NULL
+			}
+		}
+
+		columns = append(columns, column)
+	}
+
+	return columns
+}
+
+
+// extractPrimaryKeysFromConstraints extracts primary key column names from table constraints
+func extractPrimaryKeysFromConstraints(columnsDef string) []string {
+	var primaryKeys []string
+
+	// Look for PRIMARY KEY constraint defined separately
+	pkMatches := primaryKeyRegex.FindStringSubmatch(columnsDef)
+	if len(pkMatches) > 1 {
+		// pkMatches[1] contains the comma-separated list of key columns
+		keyColumns := strings.Split(pkMatches[1], ",")
+		for _, col := range keyColumns {
+			primaryKeys = append(primaryKeys, cleanIdentifier(strings.TrimSpace(col)))
+		}
+	}
+
+	return primaryKeys
+}
+
+// isPrimaryKey checks if a column is part of the primary key list extracted from constraints
+func isPrimaryKey(columnName string, primaryKeys []string) bool {
+	for _, pk := range primaryKeys {
+		if pk == columnName {
+			return true
+		}
+	}
+	return false
+}
+
+// columnExists checks if a column already exists in a table's column list
+func columnExists(columns []ColumnInfo, columnName string) bool {
+	for _, col := range columns {
+		if col.Name == columnName {
+			return true
+		}
+	}
+	return false
+}

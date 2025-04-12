@@ -1,14 +1,19 @@
-// internal/generator/generator.go - Project structure generator
+// generator.go - Обновляем метод createStandardStructure
+// internal/generator/generator.go - Updated with conditional scripts directory creation
 package generator
 
 import (
+	"bytes"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"text/template"
+	"time"
 
-	"github.com/username/goprojectgen/internal/config"
-	"github.com/username/goprojectgen/internal/generator/templates"
-	"github.com/username/goprojectgen/internal/logger"
+	"github.com/neor-it/go-project-gen/internal/config"
+	"github.com/neor-it/go-project-gen/internal/generator/templates"
+	"github.com/neor-it/go-project-gen/internal/logger"
 )
 
 // Generator represents the project generator
@@ -30,13 +35,25 @@ func (g *Generator) Generate() error {
 	g.log.Info("Generating project structure",
 		"projectName", g.config.ProjectConfig.ProjectName,
 		"moduleName", g.config.ProjectConfig.ModuleName,
+		"outputDir", g.config.OutputDir,
 	)
+
+	// Check if output directory is writable
+	testFile := filepath.Join(g.config.OutputDir, ".test-write-permission")
+	if err := os.WriteFile(testFile, []byte("test"), 0644); err != nil {
+		return fmt.Errorf("output directory %s is not writable: %w", g.config.OutputDir, err)
+	}
+
+	// Clean up test file
+	os.Remove(testFile)
 
 	// Create project directory
 	projectDir := filepath.Join(g.config.OutputDir, g.config.ProjectConfig.ProjectName)
 	if err := os.MkdirAll(projectDir, 0755); err != nil {
 		return fmt.Errorf("failed to create project directory: %w", err)
 	}
+
+	g.log.Info("Project directory created", "path", projectDir)
 
 	// Create standard Go project structure
 	if err := g.createStandardStructure(projectDir); err != nil {
@@ -53,20 +70,51 @@ func (g *Generator) Generate() error {
 		return fmt.Errorf("failed to generate component files: %w", err)
 	}
 
+	// Run go mod tidy to update dependencies
+	if err := g.runGoModTidy(projectDir); err != nil {
+		return fmt.Errorf("failed to run go mod tidy: %w", err)
+	}
+
+	return nil
+}
+
+// runGoModTidy runs go mod tidy in the project directory
+func (g *Generator) runGoModTidy(projectDir string) error {
+	g.log.Info("Running go mod tidy in the project directory")
+
+	// Create command to run go mod tidy
+	cmd := exec.Command("go", "mod", "tidy")
+	cmd.Dir = projectDir
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	// Run command
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("failed to run go mod tidy: %w", err)
+	}
+
+	g.log.Info("Successfully ran go mod tidy")
 	return nil
 }
 
 // createStandardStructure creates the standard Go project structure
 func (g *Generator) createStandardStructure(projectDir string) error {
-	// Create directories
+	// Create base directories
 	dirs := []string{
-		"cmd",
 		"internal",
 		"internal/app",
 		"internal/config",
 		"internal/logger",
 		"pkg",
-		"scripts",
+	}
+
+	// Add scripts directories only if Postgres is selected
+	if g.config.ProjectConfig.Components.Postgres {
+		dirs = append(dirs,
+			"scripts",
+			"scripts/migtool",
+			"scripts/modelgen",
+		)
 	}
 
 	for _, dir := range dirs {
@@ -106,21 +154,31 @@ func (g *Generator) generateProjectFiles(projectDir string) error {
 		return fmt.Errorf("failed to create README.md file: %w", err)
 	}
 
-	// Create config files
-	configContent := templates.ConfigTemplate()
+	// Create config files - use dynamic template generation
+	configContent := templates.ConfigTemplate(g.config.ProjectConfig)
 	if err := os.WriteFile(filepath.Join(projectDir, "internal/config/config.go"), []byte(configContent), 0644); err != nil {
 		return fmt.Errorf("failed to create config.go file: %w", err)
 	}
 
+	// Create .env and .env.example files
+	envContent := g.generateEnvFile()
+	if err := os.WriteFile(filepath.Join(projectDir, ".env.example"), []byte(envContent), 0644); err != nil {
+		return fmt.Errorf("failed to create .env.example file: %w", err)
+	}
+
+	if err := os.WriteFile(filepath.Join(projectDir, ".env"), []byte(envContent), 0644); err != nil {
+		return fmt.Errorf("failed to create .env file: %w", err)
+	}
+
 	// Create logger files
 	loggerContent := templates.LoggerTemplate()
-	if err := os.WriteFile(filepath.Join(projectDir, "internal/logger/logger.go"), []byte(loggerContent), 0644); err != nil {
+	if err := g.writeTemplateFile(filepath.Join(projectDir, "internal/logger/logger.go"), loggerContent); err != nil {
 		return fmt.Errorf("failed to create logger.go file: %w", err)
 	}
 
 	// Create app files
 	appContent := templates.AppTemplate(g.config.ProjectConfig)
-	if err := os.WriteFile(filepath.Join(projectDir, "internal/app/app.go"), []byte(appContent), 0644); err != nil {
+	if err := g.writeTemplateFile(filepath.Join(projectDir, "internal/app/app.go"), appContent); err != nil {
 		return fmt.Errorf("failed to create app.go file: %w", err)
 	}
 
@@ -149,17 +207,17 @@ func (g *Generator) generateComponentFiles(projectDir string) error {
 		}
 	}
 
+	// Generate migrations files
+	if g.config.ProjectConfig.Components.Postgres {
+		if err := g.generateMigrationsFiles(projectDir); err != nil {
+			return fmt.Errorf("failed to generate migrations files: %w", err)
+		}
+	}
+
 	// Generate Docker files
 	if g.config.ProjectConfig.Components.Docker {
 		if err := g.generateDockerFiles(projectDir); err != nil {
 			return fmt.Errorf("failed to generate Docker files: %w", err)
-		}
-	}
-
-	// Generate Kubernetes files
-	if g.config.ProjectConfig.Components.Kubernetes {
-		if err := g.generateKubernetesFiles(projectDir); err != nil {
-			return fmt.Errorf("failed to generate Kubernetes files: %w", err)
 		}
 	}
 
@@ -168,6 +226,41 @@ func (g *Generator) generateComponentFiles(projectDir string) error {
 		if err := g.generateCICDFiles(projectDir); err != nil {
 			return fmt.Errorf("failed to generate CI/CD files: %w", err)
 		}
+	}
+
+	return nil
+}
+
+// writeFile writes raw content to a file without template processing
+func (g *Generator) writeFile(path, content string) error {
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		return fmt.Errorf("failed to write file: %w", err)
+	}
+	return nil
+}
+
+// writeTemplateFile writes a template file with the given content
+func (g *Generator) writeTemplateFile(path, content string) error {
+	tmpl, err := template.New(filepath.Base(path)).Parse(content)
+	if err != nil {
+		return fmt.Errorf("failed to parse template: %w", err)
+	}
+
+	var buf bytes.Buffer
+	data := map[string]interface{}{
+		"ModuleName":  g.config.ProjectConfig.ModuleName,
+		"ProjectName": g.config.ProjectConfig.ProjectName,
+		"Username":    g.config.ProjectConfig.Username,
+		"Components":  g.config.ProjectConfig.Components,
+		"Timestamp":   time.Now().Format(time.RFC3339),
+	}
+
+	if err := tmpl.Execute(&buf, data); err != nil {
+		return fmt.Errorf("failed to execute template: %w", err)
+	}
+
+	if err := os.WriteFile(path, buf.Bytes(), 0644); err != nil {
+		return fmt.Errorf("failed to write file: %w", err)
 	}
 
 	return nil
@@ -193,22 +286,22 @@ func (g *Generator) generateHTTPFiles(projectDir string) error {
 
 	// Create API files
 	serverContent := templates.APIServerTemplate()
-	if err := os.WriteFile(filepath.Join(projectDir, "internal/api/server.go"), []byte(serverContent), 0644); err != nil {
+	if err := g.writeTemplateFile(filepath.Join(projectDir, "internal/api/server.go"), serverContent); err != nil {
 		return fmt.Errorf("failed to create server.go file: %w", err)
 	}
 
 	handlersContent := templates.APIHandlersTemplate()
-	if err := os.WriteFile(filepath.Join(projectDir, "internal/api/handlers/handlers.go"), []byte(handlersContent), 0644); err != nil {
+	if err := g.writeTemplateFile(filepath.Join(projectDir, "internal/api/handlers/handlers.go"), handlersContent); err != nil {
 		return fmt.Errorf("failed to create handlers.go file: %w", err)
 	}
 
 	middlewareContent := templates.APIMiddlewareTemplate()
-	if err := os.WriteFile(filepath.Join(projectDir, "internal/api/middleware/middleware.go"), []byte(middlewareContent), 0644); err != nil {
+	if err := g.writeTemplateFile(filepath.Join(projectDir, "internal/api/middleware/middleware.go"), middlewareContent); err != nil {
 		return fmt.Errorf("failed to create middleware.go file: %w", err)
 	}
 
 	routesContent := templates.APIRoutesTemplate()
-	if err := os.WriteFile(filepath.Join(projectDir, "internal/api/routes/routes.go"), []byte(routesContent), 0644); err != nil {
+	if err := g.writeTemplateFile(filepath.Join(projectDir, "internal/api/routes/routes.go"), routesContent); err != nil {
 		return fmt.Errorf("failed to create routes.go file: %w", err)
 	}
 
@@ -222,7 +315,6 @@ func (g *Generator) generatePostgresFiles(projectDir string) error {
 	// Create directories
 	dirs := []string{
 		"internal/db",
-		"internal/db/migrations",
 		"internal/db/models",
 		"internal/db/repositories",
 	}
@@ -235,27 +327,18 @@ func (g *Generator) generatePostgresFiles(projectDir string) error {
 
 	// Create DB files
 	dbContent := templates.DBTemplate()
-	if err := os.WriteFile(filepath.Join(projectDir, "internal/db/db.go"), []byte(dbContent), 0644); err != nil {
+	if err := g.writeTemplateFile(filepath.Join(projectDir, "internal/db/db.go"), dbContent); err != nil {
 		return fmt.Errorf("failed to create db.go file: %w", err)
 	}
 
-	modelsContent := templates.DBModelsTemplate()
-	if err := os.WriteFile(filepath.Join(projectDir, "internal/db/models/models.go"), []byte(modelsContent), 0644); err != nil {
+	modelsContent := templates.UserModelTemplate()
+	if err := g.writeTemplateFile(filepath.Join(projectDir, "internal/db/models/users.go"), modelsContent); err != nil {
 		return fmt.Errorf("failed to create models.go file: %w", err)
 	}
 
 	reposContent := templates.DBRepositoriesTemplate()
-	if err := os.WriteFile(filepath.Join(projectDir, "internal/db/repositories/repositories.go"), []byte(reposContent), 0644); err != nil {
+	if err := g.writeTemplateFile(filepath.Join(projectDir, "internal/db/repositories/repositories.go"), reposContent); err != nil {
 		return fmt.Errorf("failed to create repositories.go file: %w", err)
-	}
-
-	// Create migration files
-	migrationContent := templates.DBMigrationTemplate()
-	if err := os.WriteFile(filepath.Join(projectDir, "internal/db/migrations/000001_init.up.sql"), []byte(migrationContent), 0644); err != nil {
-		return fmt.Errorf("failed to create migration file: %w", err)
-	}
-	if err := os.WriteFile(filepath.Join(projectDir, "internal/db/migrations/000001_init.down.sql"), []byte("-- Revert initial migration"), 0644); err != nil {
-		return fmt.Errorf("failed to create migration file: %w", err)
 	}
 
 	return nil
@@ -286,34 +369,6 @@ func (g *Generator) generateDockerFiles(projectDir string) error {
 	return nil
 }
 
-// generateKubernetesFiles generates the Kubernetes-specific files
-func (g *Generator) generateKubernetesFiles(projectDir string) error {
-	g.log.Info("Generating Kubernetes files")
-
-	// Create directory
-	if err := os.MkdirAll(filepath.Join(projectDir, "deployments/kubernetes"), 0755); err != nil {
-		return fmt.Errorf("failed to create directory: %w", err)
-	}
-
-	// Create Kubernetes manifests
-	deploymentContent := templates.KubernetesDeploymentTemplate(g.config.ProjectConfig)
-	if err := os.WriteFile(filepath.Join(projectDir, "deployments/kubernetes/deployment.yaml"), []byte(deploymentContent), 0644); err != nil {
-		return fmt.Errorf("failed to create deployment.yaml: %w", err)
-	}
-
-	serviceContent := templates.KubernetesServiceTemplate(g.config.ProjectConfig)
-	if err := os.WriteFile(filepath.Join(projectDir, "deployments/kubernetes/service.yaml"), []byte(serviceContent), 0644); err != nil {
-		return fmt.Errorf("failed to create service.yaml: %w", err)
-	}
-
-	configMapContent := templates.KubernetesConfigMapTemplate(g.config.ProjectConfig)
-	if err := os.WriteFile(filepath.Join(projectDir, "deployments/kubernetes/configmap.yaml"), []byte(configMapContent), 0644); err != nil {
-		return fmt.Errorf("failed to create configmap.yaml: %w", err)
-	}
-
-	return nil
-}
-
 // generateCICDFiles generates the CI/CD-specific files
 func (g *Generator) generateCICDFiles(projectDir string) error {
 	g.log.Info("Generating CI/CD files")
@@ -327,6 +382,130 @@ func (g *Generator) generateCICDFiles(projectDir string) error {
 	workflowContent := templates.GitHubWorkflowTemplate(g.config.ProjectConfig)
 	if err := os.WriteFile(filepath.Join(projectDir, ".github/workflows/main.yml"), []byte(workflowContent), 0644); err != nil {
 		return fmt.Errorf("failed to create main.yml: %w", err)
+	}
+
+	return nil
+}
+
+func (g *Generator) generateEnvFile() string {
+	env := `# Server Configuration
+SERVER_PORT=8080
+SERVER_READ_TIMEOUT=10s
+SERVER_WRITE_TIMEOUT=10s
+
+# Logging Configuration
+LOGGING_LEVEL=info
+
+# Application Configuration
+SHUTDOWN_TIMEOUT=5s
+`
+
+	// Add database configuration if PostgreSQL is selected
+	if g.config.ProjectConfig.Components.Postgres {
+		// Base connection string uses localhost for direct development
+		env += `
+# Database Configuration for local development
+# DB_CONNECTION_STRING=postgres://postgres:postgres@localhost:5432/` + g.config.ProjectConfig.ProjectName + `?sslmode=disable
+`
+
+		// If Docker is also selected, add a commented Docker-specific connection string as reference
+		if g.config.ProjectConfig.Components.Docker {
+			env += `
+# Database Configuration for Docker environment:
+DB_CONNECTION_STRING=postgres://postgres:postgres@postgres:5432/` + g.config.ProjectConfig.ProjectName + `?sslmode=disable
+`
+		}
+	}
+
+	// Add Docker configuration if Docker is selected
+	if g.config.ProjectConfig.Components.Docker {
+		env += `
+# Docker Configuration
+DOCKER_REGISTRY=` + g.config.ProjectConfig.Username + `
+`
+	}
+
+	// Add CI/CD configuration if CI/CD is selected
+	if g.config.ProjectConfig.Components.CICD {
+		env += `
+# CI/CD Configuration
+CI_ENABLE_TESTS=true
+CI_ENABLE_LINTING=true
+`
+	}
+
+	return env
+}
+
+// generateMigrationsFiles generates the migration-specific files
+func (g *Generator) generateMigrationsFiles(projectDir string) error {
+	g.log.Info("Generating migrations files")
+
+	// Create directories
+	dirs := []string{
+		"scripts/migtool",
+		"scripts/modelgen",
+		"internal/migrations",
+		"internal/migrations/sql",
+	}
+
+	for _, dir := range dirs {
+		if err := os.MkdirAll(filepath.Join(projectDir, dir), 0755); err != nil {
+			return fmt.Errorf("failed to create directory %s: %w", dir, err)
+		}
+	}
+
+	// Create migration tool files
+	migrationToolContent := templates.MigrationToolTemplate()
+	if err := g.writeTemplateFile(filepath.Join(projectDir, "scripts/migtool/migrations.go"), migrationToolContent); err != nil {
+		return fmt.Errorf("failed to create migrations tool file: %w", err)
+	}
+
+	// Create model generator tool - Using our new comprehensive template
+	// Use writeFile directly as modelgen.go content should not be templated here.
+	modelGenContent := templates.ModelGeneratorFullTemplate()
+	if err := g.writeFile(filepath.Join(projectDir, "scripts/modelgen/modelgen.go"), modelGenContent); err != nil {
+		return fmt.Errorf("failed to create model generator file: %w", err)
+	}
+
+	// Create migration package file
+	migrationPackageContent := templates.MigrationsPackageTemplate()
+	if err := g.writeTemplateFile(filepath.Join(projectDir, "internal/migrations/migrations.go"), migrationPackageContent); err != nil {
+		return fmt.Errorf("failed to create migrations package file: %w", err)
+	}
+
+	// Create initial migration files
+	migrationUpContent := templates.MigrationFileTemplate()
+	if err := os.WriteFile(filepath.Join(projectDir, "internal/migrations/sql", "001_init.up.sql"), []byte(migrationUpContent), 0644); err != nil {
+		return fmt.Errorf("failed to create migration up file: %w", err)
+	}
+
+	migrationDownContent := templates.MigrationDownFileTemplate()
+	if err := os.WriteFile(filepath.Join(projectDir, "internal/migrations/sql", "001_init.down.sql"), []byte(migrationDownContent), 0644); err != nil {
+		return fmt.Errorf("failed to create migration down file: %w", err)
+	}
+
+	// Create migration script file
+	scriptContent := templates.MigrationsScriptTemplate()
+	scriptFile := filepath.Join(projectDir, "scripts/migrate.sh")
+	if err := os.WriteFile(scriptFile, []byte(scriptContent), 0755); err != nil {
+		return fmt.Errorf("failed to create migration script file: %w", err)
+	}
+
+	// Create model generator script file
+	modelGenScriptContent := templates.ModelGeneratorScriptTemplate()
+	modelGenScriptFile := filepath.Join(projectDir, "scripts/generate_models.sh")
+	if err := os.WriteFile(modelGenScriptFile, []byte(modelGenScriptContent), 0755); err != nil {
+		return fmt.Errorf("failed to create model generator script file: %w", err)
+	}
+
+	// Make scripts executable
+	if err := os.Chmod(scriptFile, 0755); err != nil {
+		return fmt.Errorf("failed to make migration script executable: %w", err)
+	}
+
+	if err := os.Chmod(modelGenScriptFile, 0755); err != nil {
+		return fmt.Errorf("failed to make model generator script executable: %w", err)
 	}
 
 	return nil

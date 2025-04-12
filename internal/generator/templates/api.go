@@ -10,17 +10,15 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"time"
 
 	"github.com/gin-gonic/gin"
-
 	"github.com/gin-contrib/cors"
 	"github.com/gin-contrib/pprof"
 
-	"internal/api/middleware"
-	"internal/api/routes"
-	"internal/config"
-	"internal/logger"
+	"{{ .ModuleName }}/internal/api/middleware"
+	"{{ .ModuleName }}/internal/api/routes"
+	"{{ .ModuleName }}/internal/config"
+	"{{ .ModuleName }}/internal/logger"
 )
 
 // Server represents the HTTP server
@@ -104,7 +102,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"internal/logger"
+	"{{ .ModuleName }}/internal/logger"
 )
 
 // Handler represents a HTTP handler
@@ -146,7 +144,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"internal/logger"
+	"{{ .ModuleName }}/internal/logger"
 )
 
 // Logger returns a middleware that logs HTTP requests
@@ -216,8 +214,8 @@ package routes
 import (
 	"github.com/gin-gonic/gin"
 
-	"internal/api/handlers"
-	"internal/logger"
+	"{{ .ModuleName }}/internal/api/handlers"
+	"{{ .ModuleName }}/internal/logger"
 )
 
 // RegisterRoutes registers the HTTP routes
@@ -225,11 +223,14 @@ func RegisterRoutes(router *gin.Engine, log logger.Logger, dependencies ...inter
 	// Create handlers
 	handler := handlers.NewHandler(log)
 
-	// Register routes
+	// Register top-level routes
+	router.GET("/health", handler.HealthCheck)
+	router.GET("/status", handler.Status)
+
+	// Register API v1 routes with TODO
 	v1 := router.Group("/api/v1")
 	{
-		v1.GET("/health", handler.HealthCheck)
-		v1.GET("/status", handler.Status)
+		// TODO: Add API v1 routes here
 	}
 }
 `

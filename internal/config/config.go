@@ -31,8 +31,6 @@ type Components struct {
 	Postgres bool
 	// Include Docker support
 	Docker bool
-	// Include Kubernetes manifests
-	Kubernetes bool
 	// Include CI/CD configuration
 	CICD bool
 }

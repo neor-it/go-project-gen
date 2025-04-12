@@ -1,12 +1,12 @@
 // internal/generator/templates/docker.go - Templates for Docker files
 package templates
 
-import "github.com/username/goprojectgen/internal/config"
+import "github.com/neor-it/go-project-gen/internal/config"
 
 // DockerfileTemplate returns the content of the Dockerfile
 func DockerfileTemplate(cfg config.ProjectConfig) string {
 	return `# Build stage
-FROM golang:1.21-alpine AS builder
+FROM golang:1.23-alpine AS builder
 
 # Set working directory
 WORKDIR /app
@@ -36,8 +36,8 @@ RUN apk --no-cache add ca-certificates tzdata
 # Copy binary from builder
 COPY --from=builder /app/bin/` + cfg.ProjectName + ` .
 
-# Copy configuration
-COPY --from=builder /app/config/config.yaml /app/config/
+# Copy .env file
+COPY --from=builder /app/.env.example /app/.env
 
 # Set environment variables
 ENV TZ=UTC
@@ -62,8 +62,8 @@ services:
       dockerfile: Dockerfile
     container_name: ` + cfg.ProjectName + `
     restart: unless-stopped
-    environment:
-      - TZ=UTC
+    env_file:
+      - .env
     ports:
       - "8080:8080"
 `
@@ -129,7 +129,6 @@ LICENSE
 README.md
 
 # Environment variables
-.env
 .env.local
 
 # Temporary files

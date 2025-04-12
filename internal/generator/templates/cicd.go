@@ -1,7 +1,7 @@
 // internal/generator/templates/cicd.go - Templates for CI/CD files
 package templates
 
-import "github.com/username/goprojectgen/internal/config"
+import "github.com/neor-it/go-project-gen/internal/config"
 
 // GitHubWorkflowTemplate returns the content of the GitHub Actions workflow file
 func GitHubWorkflowTemplate(cfg config.ProjectConfig) string {
@@ -24,7 +24,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.21"
+          go-version: "1.23"
 
       - name: Install dependencies
         run: go mod download
@@ -72,30 +72,5 @@ jobs:
             ` + cfg.Username + `/` + cfg.ProjectName + `:${{ github.sha }}
           cache-from: type=registry,ref=` + cfg.Username + `/` + cfg.ProjectName + `:latest
           cache-to: type=inline
-
-  deploy:
-    name: Deploy
-    runs-on: ubuntu-latest
-    needs: build
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up kubeconfig
-        uses: azure/k8s-set-context@v1
-        with:
-          kubeconfig: ${{ secrets.KUBECONFIG }}
-
-      - name: Deploy to Kubernetes
-        run: |
-          # Update image tag in deployment.yaml
-          sed -i 's|` + cfg.Username + `/` + cfg.ProjectName + `:latest|` + cfg.Username + `/` + cfg.ProjectName + `:${{ github.sha }}|' deployments/kubernetes/deployment.yaml
-          
-          # Apply Kubernetes manifests
-          kubectl apply -f deployments/kubernetes/
-          
-          # Wait for deployment to complete
-          kubectl rollout status deployment/` + cfg.ProjectName + ` --timeout=2m
 `
 }

@@ -2,14 +2,13 @@
 package templates
 
 import (
-	"github.com/username/goprojectgen/internal/config"
+	"github.com/neor-it/go-project-gen/internal/config"
 )
 
 // MainTemplate returns the content of the main.go file
 func MainTemplate(cfg config.ProjectConfig) string {
 	imports := `
 	"context"
-	"fmt"
 	"os"
 	"os/signal"
 	"syscall"
@@ -38,6 +37,9 @@ func main() {
 	if err != nil {
 		log.Fatal("Failed to load configuration", "error", err)
 	}
+	
+	// Set log level from configuration
+	log.SetLevel(cfg.GetLogLevel())
 
 	// Create and start application
 	application, err := app.NewApp(log, cfg)
@@ -72,11 +74,19 @@ func main() {
 func GoModTemplate(moduleName string) string {
 	return `module ` + moduleName + `
 
-go 1.21
+go 1.23
 
 require (
 	github.com/gin-gonic/gin v1.9.1
+	github.com/gin-contrib/cors v1.5.0
+	github.com/jmoiron/sqlx v1.3.5
+	github.com/joho/godotenv v1.5.1
+	github.com/lib/pq v1.10.9
+	github.com/golang-migrate/migrate/v4 v4.17.0
+	github.com/spf13/viper v1.18.2
 	go.uber.org/zap v1.26.0
+	github.com/gertd/go-pluralize v0.2.1
+	github.com/iancoleman/strcase v0.3.0
 )
 
 require (
@@ -104,7 +114,6 @@ require (
 	golang.org/x/net v0.20.0 // indirect
 	golang.org/x/sys v0.16.0 // indirect
 	golang.org/x/text v0.14.0 // indirect
-google.golang.org/protobuf/proto v1.32.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
 `
@@ -171,11 +180,226 @@ func ReadmeTemplate(cfg config.ProjectConfig) string {
 	if cfg.Components.Docker {
 		components += "- Docker support\n"
 	}
-	if cfg.Components.Kubernetes {
-		components += "- Kubernetes deployment\n"
-	}
 	if cfg.Components.CICD {
 		components += "- CI/CD pipeline\n"
+	}
+
+	migrationsSection := ""
+	modelsSection := ""
+
+	if cfg.Components.Postgres {
+		migrationsSection = `## Database Migrations
+
+This project uses Go-based migrations with [golang-migrate](https://github.com/golang-migrate/migrate). Migration files are stored in the 'internal/migrations/sql' directory using the format 'NNN_description.(up|down).sql'.
+
+### Running Migrations
+
+To apply migrations:
+
+` + "```bash" + `
+# Apply all pending migrations
+./scripts/migrate.sh
+
+# Apply specific number of migrations
+./scripts/migrate.sh --steps=1
+
+# Rollback migrations
+./scripts/migrate.sh --command=down
+
+# Check current migration version
+./scripts/migrate.sh --command=version
+` + "```" + `
+
+### Creating New Migrations
+
+To create a new migration:
+
+1. Create two new files in 'internal/migrations/sql/' using sequential numbering:
+   - 'NNN_description.up.sql' - Forward migration
+   - 'NNN_description.down.sql' - Rollback migration
+
+Example:
+
+` + "```sql" + `
+-- 002_add_posts_table.up.sql
+CREATE TABLE posts (
+    id SERIAL PRIMARY KEY,
+    title VARCHAR(255) NOT NULL,
+    content TEXT NOT NULL,
+    user_id INTEGER REFERENCES users(id),
+    created_at TIMESTAMP NOT NULL,
+    updated_at TIMESTAMP NOT NULL
+);
+` + "```" + `
+
+` + "```sql" + `
+-- 002_add_posts_table.down.sql
+DROP TABLE IF EXISTS posts;
+` + "```" + `
+
+`
+
+		modelsSection = `## Database Models
+
+This project can automatically generate Go struct models from your database schema.
+
+### Generating Models
+
+After applying migrations, you can generate models with:
+
+` + "```bash" + `
+# Generate all models
+./scripts/generate_models.sh
+
+# Specify output directory
+./scripts/generate_models.sh --output=internal/custom/models
+` + "```" + `
+
+The generator creates type-safe Go structs with appropriate field types and struct tags for database models.
+
+Models will be placed in 'internal/db/models/' by default.
+
+`
+	}
+
+	postgresPrereq := ""
+	if cfg.Components.Postgres {
+		postgresPrereq = "- PostgreSQL"
+	}
+
+	postgresSetup := ""
+	if cfg.Components.Postgres {
+		postgresSetup = `
+4. Set up database:
+
+   ` + "```bash" + `
+   # Run PostgreSQL (if using Docker)
+   docker-compose up -d postgres
+
+   # Apply database migrations
+   ./scripts/migrate.sh
+   ` + "```" + `
+`
+	}
+
+	apiSection := ""
+	if cfg.Components.HTTP {
+		apiSection = `│   ├── api/             # HTTP API implementation
+│   │   ├── handlers/    # HTTP request handlers
+│   │   ├── middleware/  # HTTP middleware
+│   │   └── routes/      # HTTP route definitions`
+	}
+
+	dbSection := ""
+	if cfg.Components.Postgres {
+		dbSection = `│   ├── db/              # Database code
+│   │   ├── models/      # Database models
+│   │   └── repositories/ # Data access layer
+│   ├── migrations/      # Database migrations
+│   │   └── sql/         # SQL migration files`
+	}
+
+	scriptsSection := ""
+	if cfg.Components.Postgres {
+		scriptsSection = `│   ├── migrate.sh       # Database migration script
+│   ├── generate_models.sh # Model generation script
+│   ├── migtool/         # Migration tool implementation
+│   └── modelgen/        # Model generator implementation`
+	}
+
+	dockerSection := ""
+	if cfg.Components.Docker {
+		dockerSection = `├── Dockerfile           # Docker build file
+├── docker-compose.yml   # Docker Compose file`
+	}
+
+	// Add Docker Compose section for running app with Docker
+	dockerComposeSection := ""
+	if cfg.Components.Docker {
+		dockerComposeSection = `## Running with Docker Compose
+
+This project includes Docker support for easy deployment and development.
+
+### Prerequisites
+
+- Docker
+- Docker Compose
+
+### Setup
+
+1. Make sure Docker is installed and running on your system.
+
+2. Update your .env file for Docker environment:
+
+   ` + "```bash" + `
+   # Create a copy of the example file if you haven't done so
+   cp .env.example .env
+   ` + "```" + `
+
+3. Important settings for Docker environment in .env:
+`
+		// Add database specific settings if Postgres is included
+		if cfg.Components.Postgres {
+			dockerComposeSection += `
+   ` + "```bash" + `
+   # Use the service name as the hostname (not localhost):
+   DB_CONNECTION_STRING=postgres://postgres:postgres@postgres:5432/` + cfg.ProjectName + `?sslmode=disable
+   ` + "```" + `
+`
+		}
+
+		dockerComposeSection += `
+4. Build and start the containers:
+
+   ` + "```bash" + `
+   # Start all services in detached mode
+   docker-compose up -d
+   
+   # View logs from all containers
+   docker-compose logs -f
+   
+   # Stop all services
+   docker-compose down
+   ` + "```" + `
+`
+		// Add database migration info if Postgres is included
+		if cfg.Components.Postgres {
+			dockerComposeSection += `
+5. Run database migrations from within the container:
+
+   ` + "```bash" + `
+   # Connect to the application container
+   docker-compose exec app sh
+   
+   # Inside the container, run migrations
+   ./scripts/migrate.sh
+   ` + "```" + `
+`
+		}
+
+		dockerComposeSection += `
+### Rebuilding and Updating
+
+When you make changes to the application:
+
+` + "```bash" + `
+# Rebuild the application container
+docker-compose build app
+
+# Restart with the updated image
+docker-compose up -d
+` + "```" + `
+
+### Accessing the Application
+
+Once the containers are running:
+
+- The HTTP API will be available at: http://localhost:8080
+`
+		if cfg.Components.Postgres {
+			dockerComposeSection += `- PostgreSQL will be available at: localhost:5432
+`
+		}
 	}
 
 	return `# ` + cfg.ProjectName + `
@@ -192,8 +416,9 @@ This is a Go service generated with Go Project Generator.
 
 ### Prerequisites
 
-- Go 1.21 or higher
+- Go 1.23 or higher
 - Git
+` + postgresPrereq + `
 
 ### Installation
 
@@ -210,225 +435,55 @@ This is a Go service generated with Go Project Generator.
    go mod download
    ` + "```" + `
 
-3. Build the application:
+3. Set up environment variables:
+
+   ` + "```bash" + `
+   cp .env.example .env
+   # Edit .env file with your configuration
+   ` + "```" + `
+` + postgresSetup + `
+5. Build the application:
 
    ` + "```bash" + `
    go build -o bin/` + cfg.ProjectName + ` main.go
    ` + "```" + `
 
-4. Run the application:
+6. Run the application:
 
    ` + "```bash" + `
    ./bin/` + cfg.ProjectName + `
    ` + "```" + `
 
+` + dockerComposeSection + `
+## Project Structure
+
+` + "```" + `
+├── internal/            # Private application code
+│   ├── app/             # Application initialization
+│   ├── config/          # Configuration handling
+│   ├── logger/          # Logging implementation
+` + apiSection + `
+` + dbSection + `
+├── pkg/                 # Public libraries
+├── scripts/             # Utility scripts
+` + scriptsSection + `
+├── main.go              # Application entry point
+├── go.mod               # Go module file
+├── go.sum               # Go module checksums
+` + dockerSection + `
+├── .env.example         # Example environment file
+├── .env                 # Environment file (git-ignored)
+└── README.md            # This file
+` + "```" + `
+
 ## Configuration
 
-The application is configured using environment variables or a configuration file.
+The application is configured using environment variables in the .env file.
 
+` + migrationsSection + modelsSection + `
 ## License
 
 This project is licensed under the MIT License - see the LICENSE file for details.
-`
-}
-
-// ConfigTemplate returns the content of the config.go file
-func ConfigTemplate() string {
-	return `// internal/config/config.go - Configuration loading and parsing
-package config
-
-import (
-	"fmt"
-	"os"
-	"time"
-
-	"github.com/spf13/viper"
-)
-
-// Config represents the application configuration
-type Config struct {
-	// Server configuration
-	Server struct {
-		Port         int           ` + "`mapstructure:\"port\" yaml:\"port\"`" + `
-		ReadTimeout  time.Duration ` + "`mapstructure:\"read_timeout\" yaml:\"read_timeout\"`" + `
-		WriteTimeout time.Duration ` + "`mapstructure:\"write_timeout\" yaml:\"write_timeout\"`" + `
-	} ` + "`mapstructure:\"server\" yaml:\"server\"`" + `
-
-	// Database configuration
-	Database struct {
-		Host     string ` + "`mapstructure:\"host\" yaml:\"host\"`" + `
-		Port     int    ` + "`mapstructure:\"port\" yaml:\"port\"`" + `
-		User     string ` + "`mapstructure:\"user\" yaml:\"user\"`" + `
-		Password string ` + "`mapstructure:\"password\" yaml:\"password\"`" + `
-		Name     string ` + "`mapstructure:\"name\" yaml:\"name\"`" + `
-		SSLMode  string ` + "`mapstructure:\"ssl_mode\" yaml:\"ssl_mode\"`" + `
-	} ` + "`mapstructure:\"database\" yaml:\"database\"`" + `
-
-	// Logging configuration
-	Logging struct {
-		Level  string ` + "`mapstructure:\"level\" yaml:\"level\"`" + `
-		Format string ` + "`mapstructure:\"format\" yaml:\"format\"`" + `
-	} ` + "`mapstructure:\"logging\" yaml:\"logging\"`" + `
-
-	// Shutdown timeout
-	ShutdownTimeout time.Duration ` + "`mapstructure:\"shutdown_timeout\" yaml:\"shutdown_timeout\"`" + `
-}
-
-// LoadConfig loads the configuration from environment variables or a file
-func LoadConfig() (*Config, error) {
-	var config Config
-
-	// Set default values
-	viper.SetDefault("server.port", 8080)
-	viper.SetDefault("server.read_timeout", "10s")
-	viper.SetDefault("server.write_timeout", "10s")
-	viper.SetDefault("database.host", "localhost")
-	viper.SetDefault("database.port", 5432)
-	viper.SetDefault("database.user", "postgres")
-	viper.SetDefault("database.password", "postgres")
-	viper.SetDefault("database.name", "postgres")
-	viper.SetDefault("database.ssl_mode", "disable")
-	viper.SetDefault("logging.level", "info")
-	viper.SetDefault("logging.format", "json")
-	viper.SetDefault("shutdown_timeout", "5s")
-
-	// Read from environment variables
-	viper.AutomaticEnv()
-
-	// Look for config file
-	viper.SetConfigName("config")
-	viper.SetConfigType("yaml")
-	viper.AddConfigPath(".")
-	viper.AddConfigPath("./config")
-	viper.AddConfigPath("/etc/app")
-
-	// Read config file
-	if err := viper.ReadInConfig(); err != nil {
-		// It's okay if config file doesn't exist
-		if _, ok := err.(viper.ConfigFileNotFoundError); !ok {
-			return nil, fmt.Errorf("failed to read config file: %w", err)
-		}
-	}
-
-	// Unmarshal config
-	if err := viper.Unmarshal(&config); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal config: %w", err)
-	}
-
-	return &config, nil
-}
-
-// ConnectionString returns the database connection string
-func (c *Config) ConnectionString() string {
-	return fmt.Sprintf(
-		"host=%s port=%d user=%s password=%s dbname=%s sslmode=%s",
-		c.Database.Host,
-		c.Database.Port,
-		c.Database.User,
-		c.Database.Password,
-		c.Database.Name,
-		c.Database.SSLMode,
-	)
-}
-`
-}
-
-// LoggerTemplate returns the content of the logger.go file
-func LoggerTemplate() string {
-	return `// internal/logger/logger.go - Logger implementation
-package logger
-
-import (
-	"os"
-
-	"go.uber.org/zap"
-	"go.uber.org/zap/zapcore"
-)
-
-// Logger interface defines the methods that the logger should implement
-type Logger interface {
-	Debug(msg string, keysAndValues ...interface{})
-	Info(msg string, keysAndValues ...interface{})
-	Warn(msg string, keysAndValues ...interface{})
-	Error(msg string, keysAndValues ...interface{})
-	Fatal(msg string, keysAndValues ...interface{})
-	With(keysAndValues ...interface{}) Logger
-}
-
-// ZapLogger implements the Logger interface using Zap
-type ZapLogger struct {
-	logger *zap.SugaredLogger
-}
-
-// NewLogger creates a new logger
-func NewLogger() Logger {
-	// Create encoder configuration
-	encoderConfig := zapcore.EncoderConfig{
-		TimeKey:        "time",
-		LevelKey:       "level",
-		NameKey:        "logger",
-		CallerKey:      "caller",
-		FunctionKey:    zapcore.OmitKey,
-		MessageKey:     "msg",
-		StacktraceKey:  "stacktrace",
-		LineEnding:     zapcore.DefaultLineEnding,
-		EncodeLevel:    zapcore.LowercaseLevelEncoder,
-		EncodeTime:     zapcore.ISO8601TimeEncoder,
-		EncodeDuration: zapcore.StringDurationEncoder,
-		EncodeCaller:   zapcore.ShortCallerEncoder,
-	}
-
-	// Create JSON encoder
-	jsonEncoder := zapcore.NewJSONEncoder(encoderConfig)
-
-	// Create core
-	core := zapcore.NewCore(
-		jsonEncoder,
-		zapcore.AddSync(os.Stdout),
-		zap.NewAtomicLevelAt(zapcore.InfoLevel),
-	)
-
-	// Create logger
-	logger := zap.New(core, zap.AddCaller(), zap.AddStacktrace(zapcore.ErrorLevel))
-	defer logger.Sync()
-
-	// Return sugared logger
-	return &ZapLogger{
-		logger: logger.Sugar(),
-	}
-}
-
-// Debug logs a debug message
-func (l *ZapLogger) Debug(msg string, keysAndValues ...interface{}) {
-	l.logger.Debugw(msg, keysAndValues...)
-}
-
-// Info logs an info message
-func (l *ZapLogger) Info(msg string, keysAndValues ...interface{}) {
-	l.logger.Infow(msg, keysAndValues...)
-}
-
-// Warn logs a warning message
-func (l *ZapLogger) Warn(msg string, keysAndValues ...interface{}) {
-	l.logger.Warnw(msg, keysAndValues...)
-}
-
-// Error logs an error message
-func (l *ZapLogger) Error(msg string, keysAndValues ...interface{}) {
-	l.logger.Errorw(msg, keysAndValues...)
-}
-
-// Fatal logs a fatal message and exits
-func (l *ZapLogger) Fatal(msg string, keysAndValues ...interface{}) {
-	l.logger.Fatalw(msg, keysAndValues...)
-}
-
-// With returns a logger with the given key-value pairs
-func (l *ZapLogger) With(keysAndValues ...interface{}) Logger {
-	return &ZapLogger{
-		logger: l.logger.With(keysAndValues...),
-	}
-}
 `
 }
 

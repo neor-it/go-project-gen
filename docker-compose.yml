@@ -10,7 +10,8 @@ services:
     environment:
       - TZ=UTC
     volumes:
-      - .:/output
-    working_dir: /output
-    stdin_open: true
-    tty: true
+      - .:/app  # Mount the current directory to /app in the container
+      - ${PWD}:/output  # Mount the current directory to /output for writing generated projects
+    working_dir: /app
+    stdin_open: true  # Keeps STDIN open for interactive CLI
+    tty: true  # Allocates a pseudo-TTY for interactive CLI

@@ -8,17 +8,13 @@ package db
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"time"
 
-	"github.com/golang-migrate/migrate/v4"
-	_ "github.com/golang-migrate/migrate/v4/database/postgres"
-	_ "github.com/golang-migrate/migrate/v4/source/file"
 	"github.com/jmoiron/sqlx"
 	_ "github.com/lib/pq"
 
-	"internal/logger"
+	"{{ .ModuleName }}/internal/logger"
 )
 
 // Database represents a database connection
@@ -55,12 +51,6 @@ func (d *Database) Connect() error {
 	d.db = db
 
 	d.log.Info("Connected to database")
-
-	// Run migrations
-	if err := d.Migrate(); err != nil {
-		return fmt.Errorf("failed to run migrations: %w", err)
-	}
-
 	return nil
 }
 
@@ -78,30 +68,6 @@ func (d *Database) Ping(ctx context.Context) error {
 	return d.db.PingContext(ctx)
 }
 
-// Migrate runs database migrations
-func (d *Database) Migrate() error {
-	d.log.Info("Running database migrations")
-
-	// Create migrate instance
-	m, err := migrate.New("file://internal/db/migrations", d.connString)
-	if err != nil {
-		return fmt.Errorf("failed to create migrate instance: %w", err)
-	}
-	defer m.Close()
-
-	// Run migrations
-	if err := m.Up(); err != nil {
-		if errors.Is(err, migrate.ErrNoChange) {
-			d.log.Info("No migrations to run")
-			return nil
-		}
-		return fmt.Errorf("failed to run migrations: %w", err)
-	}
-
-	d.log.Info("Database migrations completed")
-	return nil
-}
-
 // GetDB returns the database connection
 func (d *Database) GetDB() *sqlx.DB {
 	return d.db
@@ -109,29 +75,28 @@ func (d *Database) GetDB() *sqlx.DB {
 `
 }
 
-// DBModelsTemplate returns the content of the models.go file
-func DBModelsTemplate() string {
-	return `// internal/db/models/models.go - Database models
+// UserModelTemplate returns the template for a User model
+func UserModelTemplate() string {
+	return `// internal/db/models/users.go - User model
 package models
 
 import (
 	"time"
 )
 
-// Base model with common fields
-type BaseModel struct {
-	ID        int64      ` + "`db:\"id\" json:\"id\"`" + `
-	CreatedAt time.Time  ` + "`db:\"created_at\" json:\"created_at\"`" + `
-	UpdatedAt time.Time  ` + "`db:\"updated_at\" json:\"updated_at\"`" + `
-	DeletedAt *time.Time ` + "`db:\"deleted_at\" json:\"deleted_at,omitempty\"`" + `
-}
-
-// User model
+// User represents the users table
 type User struct {
-	BaseModel
+	Id 	 int        ` + "`db:\"id\" json:\"id\"`" + `
 	Username string ` + "`db:\"username\" json:\"username\"`" + `
 	Email    string ` + "`db:\"email\" json:\"email\"`" + `
 	Password string ` + "`db:\"password\" json:\"-\"`" + `
+	CreatedAt time.Time  ` + "`db:\"created_at\" json:\"created_at\"`" + `
+	UpdatedAt time.Time  ` + "`db:\"updated_at\" json:\"updated_at\"`" + `
+}
+
+// TableName returns the table name for User
+func (u *User) TableName() string {
+	return "users"
 }
 `
 }
@@ -150,8 +115,8 @@ import (
 
 	"github.com/jmoiron/sqlx"
 
-	"internal/db/models"
-	"internal/logger"
+	"{{ .ModuleName }}/internal/db/models"
+	"{{ .ModuleName }}/internal/logger"
 )
 
 // UserRepository represents a repository for users
@@ -171,7 +136,7 @@ func NewUserRepository(log logger.Logger, db *sqlx.DB) *UserRepository {
 // GetByID gets a user by ID
 func (r *UserRepository) GetByID(ctx context.Context, id int64) (*models.User, error) {
 	var user models.User
-	query := "SELECT * FROM users WHERE id = $1 AND deleted_at IS NULL"
+	query := "SELECT * FROM users WHERE id = $1"
 	err := r.db.GetContext(ctx, &user, query, id)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -218,7 +183,7 @@ func (r *UserRepository) Update(ctx context.Context, user *models.User) error {
 	query := ` + "`" + `
 		UPDATE users
 		SET username = $1, email = $2, updated_at = $3
-		WHERE id = $4 AND deleted_at IS NULL
+		WHERE id = $4
 	` + "`" + `
 
 	result, err := r.db.ExecContext(
@@ -250,8 +215,8 @@ func (r *UserRepository) Update(ctx context.Context, user *models.User) error {
 func (r *UserRepository) Delete(ctx context.Context, id int64) error {
 	now := time.Now()
 
-	query := "UPDATE users SET deleted_at = $1 WHERE id = $2 AND deleted_at IS NULL"
-	result, err := r.db.ExecContext(ctx, query, now, id)
+	query := "UPDATE users SET WHERE id = $1"
+	result, err := r.db.ExecContext(ctx, query, id)
 	if err != nil {
 		return fmt.Errorf("failed to delete user: %w", err)
 	}
@@ -271,31 +236,12 @@ func (r *UserRepository) Delete(ctx context.Context, id int64) error {
 // List lists all users
 func (r *UserRepository) List(ctx context.Context, limit, offset int) ([]*models.User, error) {
 	var users []*models.User
-	query := "SELECT * FROM users WHERE deleted_at IS NULL ORDER BY id LIMIT $1 OFFSET $2"
+	query := "SELECT * FROM users WHERE ORDER BY id LIMIT $1 OFFSET $2"
 	err := r.db.SelectContext(ctx, &users, query, limit, offset)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list users: %w", err)
 	}
 	return users, nil
 }
-`
-}
-
-// DBMigrationTemplate returns the content of the initial migration file
-func DBMigrationTemplate() string {
-	return `-- Create users table
-CREATE TABLE IF NOT EXISTS users (
-    id SERIAL PRIMARY KEY,
-    username VARCHAR(255) NOT NULL UNIQUE,
-    email VARCHAR(255) NOT NULL UNIQUE,
-    password VARCHAR(255) NOT NULL,
-    created_at TIMESTAMP NOT NULL,
-    updated_at TIMESTAMP NOT NULL,
-    deleted_at TIMESTAMP
-);
-
--- Create indexes
-CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);
-CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
 `
 }
